@@ -68,7 +68,29 @@ def _reserve(args, full: bool) -> int:
         tail_curve=args.tail_curve,
         apriori=args.apriori,
         exposure=_parse_exposure(args.exposure),
+        column=args.column,
     ))
+    return 0
+
+
+def _cmd_bootstrap(args) -> int:
+    agent = ChainladderAgent()
+    agent.load_sample(args.sample, args.sample)
+    _print(agent.bootstrap(args.sample, n_sims=args.n_sims,
+                           random_state=args.random_state, column=args.column))
+    return 0
+
+
+def _cmd_berquist_sherman(args) -> int:
+    agent = ChainladderAgent()
+    agent.load_sample(args.sample, args.sample)
+    adjusted = agent.berquist_sherman(args.sample, trend=args.trend,
+                                      new_triangle_id=args.sample + "_adj")
+    if "error" in adjusted:
+        _print(adjusted)
+        return 0
+    _print(agent.reserve_summary(adjusted["triangle_id"], method=args.method,
+                                 column=args.column))
     return 0
 
 
@@ -144,11 +166,15 @@ def _cmd_call(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+_RESERVE_METHODS = [
+    "chainladder", "mack", "bornhuetter_ferguson", "benktander", "cape_cod",
+    "expected_loss", "incremental_additive", "clark_ldf",
+]
+
+
 def _add_reserve_args(parser) -> None:
     parser.add_argument("sample", help="Sample triangle name (e.g. raa, genins).")
-    parser.add_argument("--method", default="chainladder",
-                        choices=["chainladder", "mack", "bornhuetter_ferguson",
-                                 "benktander", "cape_cod"])
+    parser.add_argument("--method", default="chainladder", choices=_RESERVE_METHODS)
     parser.add_argument("--n-periods", type=int, default=-1, dest="n_periods")
     parser.add_argument("--average", default="volume",
                         choices=["volume", "simple", "regression", "geometric"])
@@ -157,7 +183,9 @@ def _add_reserve_args(parser) -> None:
                         choices=["exponential", "inverse_power"])
     parser.add_argument("--apriori", type=float, default=1.0)
     parser.add_argument("--exposure", default=None,
-                        help="Number, JSON list, or sample name (BF/CapeCod/Benktander).")
+                        help="Number, JSON list, or sample name (exposure-based methods).")
+    parser.add_argument("--column", default=None,
+                        help="Measure column for a multi-column triangle.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -194,6 +222,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tail-curve", default="exponential", dest="tail_curve",
                    choices=["exponential", "inverse_power"])
     p.set_defaults(func=_cmd_mack)
+
+    p = sub.add_parser("bootstrap", help="ODP-bootstrap reserve distribution.")
+    p.add_argument("sample")
+    p.add_argument("--n-sims", type=int, default=1000, dest="n_sims")
+    p.add_argument("--random-state", type=int, default=None, dest="random_state")
+    p.add_argument("--column", default=None)
+    p.set_defaults(func=_cmd_bootstrap)
+
+    p = sub.add_parser("berquist-sherman",
+                       help="Berquist-Sherman adjustment, then reserve the result.")
+    p.add_argument("sample")
+    p.add_argument("--trend", type=float, default=0.0)
+    p.add_argument("--method", default="chainladder", choices=_RESERVE_METHODS)
+    p.add_argument("--column", default="Incurred")
+    p.set_defaults(func=_cmd_berquist_sherman)
 
     sub.add_parser("serve", help="Run the MCP server over stdio.").set_defaults(
         func=_cmd_serve)

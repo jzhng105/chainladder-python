@@ -66,9 +66,17 @@ def _tool_definitions() -> list[types.Tool]:
         "type": "string",
         "enum": [
             "chainladder", "mack", "bornhuetter_ferguson", "benktander", "cape_cod",
+            "expected_loss", "incremental_additive", "clark_ldf",
         ],
         "default": "chainladder",
-        "description": "Reserving method.",
+        "description": "Reserving method. 'incremental_additive' is the additive "
+        "(AF) method and 'expected_loss' the budgeted-loss method (both need "
+        "exposure); 'clark_ldf' is Clark's growth-curve method.",
+    }
+    column = {
+        "type": "string",
+        "description": "Measure column to use for a multi-column triangle (the "
+        "index is summed across segments).",
     }
     apriori = {
         "type": "number",
@@ -119,6 +127,7 @@ def _tool_definitions() -> list[types.Tool]:
         "drop_high": drop_high,
         "drop_low": drop_low,
         "drop_valuation": drop_valuation,
+        "column": column,
     }
     reserve_props = {
         "triangle_id": {"type": "string", "description": "Cached triangle id."},
@@ -278,6 +287,47 @@ def _tool_definitions() -> list[types.Tool]:
                 "required": ["triangle_id"],
             },
         ),
+        types.Tool(
+            name="bootstrap",
+            description="Stochastic ODP-bootstrap reserve distribution: mean, "
+            "standard error, CoV and percentiles of total IBNR.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "triangle_id": {"type": "string"},
+                    "n_sims": {"type": "integer", "default": 1000,
+                               "description": "Number of bootstrap simulations."},
+                    "n_periods": n_periods,
+                    "random_state": {"type": "integer",
+                                     "description": "Seed for reproducibility."},
+                    "percentiles": {
+                        "type": "array", "items": {"type": "number"},
+                        "description": "Percentiles as fractions, e.g. [0.5, 0.75, 0.95].",
+                    },
+                    "column": column,
+                },
+                "required": ["triangle_id"],
+            },
+        ),
+        types.Tool(
+            name="berquist_sherman",
+            description="Berquist-Sherman adjustment for case-reserve adequacy and "
+            "settlement-rate changes; caches the restated triangle.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "triangle_id": {"type": "string"},
+                    "paid_amount": {"type": "string", "default": "Paid"},
+                    "incurred_amount": {"type": "string", "default": "Incurred"},
+                    "reported_count": {"type": "string", "default": "Reported"},
+                    "closed_count": {"type": "string", "default": "Closed"},
+                    "trend": {"type": "number", "default": 0.0,
+                              "description": "Annual severity trend assumption."},
+                    "new_triangle_id": {"type": "string", "description": "Optional cache id."},
+                },
+                "required": ["triangle_id"],
+            },
+        ),
     ]
 
 
@@ -296,6 +346,8 @@ def _dispatch():
         "ibnr": agent.ibnr,
         "reserve_summary": agent.reserve_summary,
         "mack_diagnostics": agent.mack_diagnostics,
+        "bootstrap": agent.bootstrap,
+        "berquist_sherman": agent.berquist_sherman,
     }
 
 

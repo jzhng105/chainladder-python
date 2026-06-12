@@ -34,11 +34,38 @@ Two console scripts are registered:
 | `ibnr` | Run a reserving method; ultimate/IBNR totals + by-origin |
 | `reserve_summary` | Full by-origin reserve table (latest/ultimate/IBNR) |
 | `mack_diagnostics` | Mack stochastic standard error & coefficient of variation |
+| `bootstrap` | ODP-bootstrap reserve distribution (mean, std, CoV, percentiles) |
+| `berquist_sherman` | Berquist-Sherman case-reserve/settlement-rate adjustment |
 
-Reserving methods: `chainladder`, `mack`, `bornhuetter_ferguson`,
-`benktander`, `cape_cod`. The exposure-based methods take an `exposure`
-(a number, a per-origin list, or a sample name) and, where relevant, an
-`apriori` loss ratio.
+### Reserving methods (`ibnr` / `reserve_summary`)
+
+| Method | Notes |
+| --- | --- |
+| `chainladder` | Volume-weighted chain ladder |
+| `mack` | Mack chain ladder (also see `mack_diagnostics`) |
+| `bornhuetter_ferguson` | Needs `exposure` + `apriori` |
+| `benktander` | Iterated BF; needs `exposure` + `apriori` |
+| `cape_cod` | Stanard-Bühlmann; needs `exposure` |
+| `expected_loss` | Budgeted-loss method; needs `exposure` + `apriori` |
+| `incremental_additive` | Additive (AF) method; needs `exposure` |
+| `clark_ldf` | Clark's growth-curve (LDF) method |
+
+Exposure-based methods take an `exposure` (a number, a per-origin list, or a
+sample name) and, where relevant, an `apriori` loss ratio.
+
+### Stochastic reserving
+
+- `mack_diagnostics` — analytic Mack standard error and coefficient of variation.
+- `bootstrap` — over-dispersed Poisson bootstrap; returns the mean, standard
+  error, CoV and percentiles of the simulated total-IBNR distribution
+  (`n_sims`, `random_state` for reproducibility).
+
+### Multi-column / multi-segment triangles
+
+Samples such as `clrd` and `berqsherm` carry several measure columns and an
+index of segments. Pass `column` to pick a measure (e.g. `"Incurred"`); the
+index is summed across segments. `berquist_sherman` restates such a triangle
+and caches the result under a new `triangle_id` for reserving.
 
 ### Grain
 
@@ -74,7 +101,11 @@ chainladder factors raa --average simple
 chainladder grain quarterly OYDY
 chainladder ibnr raa --method chainladder --summary
 chainladder ibnr raa --method bornhuetter_ferguson --apriori 0.7 --exposure 20000
+chainladder ibnr raa --method incremental_additive --exposure 20000   # additive (AF)
+chainladder ibnr raa --method clark_ldf
 chainladder mack raa --tail
+chainladder bootstrap raa --n-sims 1000 --random-state 42              # stochastic
+chainladder berquist-sherman berqsherm --trend 0.15 --column Incurred  # adjust + reserve
 chainladder serve                       # == chainladder-mcp
 chainladder tools                       # list tools through a server subprocess
 chainladder call development_factors --json '{"triangle_id": "raa", "average": ["simple", "volume", "volume", "volume", "volume", "volume", "volume", "volume", "volume"]}'

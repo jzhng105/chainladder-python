@@ -33,13 +33,17 @@ logger = logging.getLogger(__name__)
 
 # Reserving methods that can be produced by the ``ibnr`` / ``reserve_summary``
 # tools. ``exposure`` flags methods that require a sample_weight (premium /
-# exposure) base and an a-priori expectation.
+# exposure) base; ``exposure_on`` says whether that weight is consumed by the
+# development step (the additive method) or by the reserving model.
 _METHODS = {
     "chainladder": {"exposure": False},
     "mack": {"exposure": False},
-    "bornhuetter_ferguson": {"exposure": True},
-    "benktander": {"exposure": True},
-    "cape_cod": {"exposure": True},
+    "bornhuetter_ferguson": {"exposure": True, "exposure_on": "model"},
+    "benktander": {"exposure": True, "exposure_on": "model"},
+    "cape_cod": {"exposure": True, "exposure_on": "model"},
+    "expected_loss": {"exposure": True, "exposure_on": "model"},
+    "incremental_additive": {"exposure": True, "exposure_on": "dev"},
+    "clark_ldf": {"exposure": False},
 }
 
 _AVERAGES = ("volume", "simple", "regression", "geometric")
@@ -108,6 +112,28 @@ class ChainladderAgent:
                 f"Available: {list(self.triangles)}"
             )
         return self.triangles[triangle_id]
+
+    def _prepare(self, triangle: cl.Triangle, column: str | None = None) -> cl.Triangle:
+        """Reduce a triangle to the single index/column the estimators expect.
+
+        Selects ``column`` when given; errors if more than one measure column
+        remains; sums across the index when a triangle carries several segments.
+        """
+        result = triangle
+        if column is not None:
+            if column not in result.columns:
+                raise ValueError(
+                    f"Column '{column}' not found. Available: {list(result.columns)}"
+                )
+            result = result[column]
+        if result.shape[1] > 1:
+            raise ValueError(
+                f"Triangle has multiple columns {list(result.columns)}; "
+                "pass 'column' to choose one."
+            )
+        if result.shape[0] > 1:
+            result = result.sum("index")
+        return result
 
     @staticmethod
     def _origin_vector(triangle: cl.Triangle) -> dict[str, float]:
@@ -205,11 +231,17 @@ class ChainladderAgent:
         """Return shape, grains, valuation date and the latest diagonal."""
         try:
             triangle = self._get(triangle_id)
-            return {
-                "triangle_id": triangle_id,
-                **self.metadata[triangle_id],
-                "latest_diagonal": self._origin_vector(triangle.latest_diagonal),
-            }
+            out = {"triangle_id": triangle_id, **self.metadata[triangle_id]}
+            # The latest diagonal is only an origin vector for a single
+            # index/column triangle; otherwise just report the totals shape.
+            if triangle.shape[0] == 1 and triangle.shape[1] == 1:
+                out["latest_diagonal"] = self._origin_vector(triangle.latest_diagonal)
+            else:
+                out["note"] = (
+                    "Multi-dimensional triangle; pass a 'column' (and the index "
+                    "is summed) when developing or reserving."
+                )
+            return out
         except Exception as exc:
             return {"error": str(exc)}
 
@@ -257,10 +289,11 @@ class ChainladderAgent:
         drop_high=None,
         drop_low=None,
         drop_valuation=None,
+        column=None,
     ) -> dict:
         """Age-to-age (link ratio) factors plus the selected LDFs."""
         try:
-            triangle = self._get(triangle_id)
+            triangle = self._prepare(self._get(triangle_id), column)
             dev = self._development(
                 n_periods, average, drop, drop_high, drop_low, drop_valuation,
             ).fit(triangle)
@@ -287,10 +320,11 @@ class ChainladderAgent:
         drop_high=None,
         drop_low=None,
         drop_valuation=None,
+        column=None,
     ) -> dict:
         """Selected LDFs and the cumulative development factors (CDFs)."""
         try:
-            triangle = self._get(triangle_id)
+            triangle = self._prepare(self._get(triangle_id), column)
             dev = self._development(
                 n_periods, average, drop, drop_high, drop_low, drop_valuation,
             ).fit(triangle)
@@ -316,12 +350,13 @@ class ChainladderAgent:
         drop_high=None,
         drop_low=None,
         drop_valuation=None,
+        column=None,
     ) -> dict:
         """Fit a tail curve to the development pattern and report the tail factor."""
         try:
             if curve not in _CURVES:
                 return {"error": f"curve must be one of {list(_CURVES)}"}
-            triangle = self._get(triangle_id)
+            triangle = self._prepare(self._get(triangle_id), column)
             pipe = cl.Pipeline([
                 ("dev", self._development(
                     n_periods, average, drop, drop_high, drop_low, drop_valuation)),
@@ -344,6 +379,22 @@ class ChainladderAgent:
     # ------------------------------------------------------------------ #
     # reserving
     # ------------------------------------------------------------------ #
+    def _dev_step(self, method: str, dev_kwargs: dict):
+        """The development transformer for a method (Clark and the additive
+        method bring their own patterns; everything else uses ``Development``)."""
+        if method == "clark_ldf":
+            return cl.ClarkLDF()
+        if method == "incremental_additive":
+            return cl.IncrementalAdditive(
+                n_periods=dev_kwargs["n_periods"],
+                average=dev_kwargs["average"],
+                drop=_norm_drop(dev_kwargs["drop"]),
+                drop_high=dev_kwargs["drop_high"],
+                drop_low=dev_kwargs["drop_low"],
+                drop_valuation=dev_kwargs["drop_valuation"],
+            )
+        return self._development(**dev_kwargs)
+
     def _build_model(
         self,
         triangle: cl.Triangle,
@@ -354,33 +405,34 @@ class ChainladderAgent:
         exposure: float | list | str | None,
         dev_kwargs: dict,
     ):
-        steps = [("dev", self._development(**dev_kwargs))]
-        if tail:
+        if method not in _METHODS:  # pragma: no cover - guarded by caller
+            raise ValueError(f"Unknown method '{method}'")
+        self._validate_average(dev_kwargs["average"])
+
+        steps = [("dev", self._dev_step(method, dev_kwargs))]
+        if tail and method not in ("clark_ldf",):
             steps.append(("tail", cl.TailCurve(curve=tail_curve)))
 
-        sample_weight = None
-        if method == "chainladder":
-            estimator = cl.Chainladder()
-        elif method == "mack":
-            estimator = cl.MackChainladder()
-        elif method == "bornhuetter_ferguson":
-            estimator = cl.BornhuetterFerguson(apriori=apriori)
-            sample_weight = self._exposure_triangle(triangle, exposure)
-        elif method == "benktander":
-            estimator = cl.Benktander(apriori=apriori, n_iters=2)
-            sample_weight = self._exposure_triangle(triangle, exposure)
-        elif method == "cape_cod":
-            estimator = cl.CapeCod()
-            sample_weight = self._exposure_triangle(triangle, exposure)
-        else:  # pragma: no cover - guarded by caller
-            raise ValueError(f"Unknown method '{method}'")
+        models = {
+            "chainladder": lambda: cl.Chainladder(),
+            "mack": lambda: cl.MackChainladder(),
+            "incremental_additive": lambda: cl.Chainladder(),
+            "clark_ldf": lambda: cl.Chainladder(),
+            "bornhuetter_ferguson": lambda: cl.BornhuetterFerguson(apriori=apriori),
+            "benktander": lambda: cl.Benktander(apriori=apriori, n_iters=2),
+            "cape_cod": lambda: cl.CapeCod(),
+            "expected_loss": lambda: cl.ExpectedLoss(apriori=apriori),
+        }
+        steps.append(("model", models[method]()))
 
-        steps.append(("model", estimator))
+        fit_params = {}
+        spec = _METHODS[method]
+        if spec["exposure"]:
+            weight = self._exposure_triangle(triangle, exposure)
+            fit_params[f"{spec['exposure_on']}__sample_weight"] = weight
+
         pipe = cl.Pipeline(steps)
-        if sample_weight is not None:
-            pipe.fit(triangle, model__sample_weight=sample_weight)
-        else:
-            pipe.fit(triangle)
+        pipe.fit(triangle, **fit_params)
         return pipe.named_steps.model
 
     def ibnr(
@@ -397,12 +449,13 @@ class ChainladderAgent:
         drop_high=None,
         drop_low=None,
         drop_valuation=None,
+        column=None,
     ) -> dict:
         """Run a reserving method and return ultimate / IBNR totals and by-origin."""
         try:
             if method not in _METHODS:
                 return {"error": f"method must be one of {list(_METHODS)}"}
-            triangle = self._get(triangle_id)
+            triangle = self._prepare(self._get(triangle_id), column)
             model = self._build_model(
                 triangle, method, tail, tail_curve, apriori, exposure,
                 dict(n_periods=n_periods, average=average, drop=drop,
@@ -436,12 +489,13 @@ class ChainladderAgent:
         drop_high=None,
         drop_low=None,
         drop_valuation=None,
+        column=None,
     ) -> dict:
         """Full by-origin reserve table: latest, ultimate and IBNR side by side."""
         try:
             if method not in _METHODS:
                 return {"error": f"method must be one of {list(_METHODS)}"}
-            triangle = self._get(triangle_id)
+            triangle = self._prepare(self._get(triangle_id), column)
             model = self._build_model(
                 triangle, method, tail, tail_curve, apriori, exposure,
                 dict(n_periods=n_periods, average=average, drop=drop,
@@ -484,10 +538,11 @@ class ChainladderAgent:
         drop_high=None,
         drop_low=None,
         drop_valuation=None,
+        column=None,
     ) -> dict:
         """Mack chain-ladder stochastic diagnostics (standard error & CoV)."""
         try:
-            triangle = self._get(triangle_id)
+            triangle = self._prepare(self._get(triangle_id), column)
             model = self._build_model(
                 triangle, "mack", tail, tail_curve, 1.0, None,
                 dict(n_periods=n_periods, average=average, drop=drop,
@@ -505,6 +560,84 @@ class ChainladderAgent:
             }
         except Exception as exc:
             logger.exception("mack_diagnostics failed")
+            return {"error": str(exc)}
+
+    def bootstrap(
+        self,
+        triangle_id: str,
+        n_sims: int = 1000,
+        n_periods: int = -1,
+        random_state: int | None = None,
+        percentiles: list | None = None,
+        column=None,
+    ) -> dict:
+        """ODP-bootstrap reserve distribution (mean, std, CoV and percentiles).
+
+        Resamples the triangle ``n_sims`` times with the over-dispersed Poisson
+        bootstrap, develops each replicate with the chain ladder, and summarises
+        the simulated distribution of total IBNR.
+        """
+        try:
+            triangle = self._prepare(self._get(triangle_id), column)
+            samples = cl.BootstrapODPSample(
+                n_sims=n_sims, n_periods=n_periods, random_state=random_state,
+            ).fit_transform(triangle)
+            model = cl.Chainladder().fit(samples)
+            sim_ibnr = np.asarray(model.ibnr_.sum("origin").values).ravel()
+            sim_ibnr = sim_ibnr[~np.isnan(sim_ibnr)]
+            pct = percentiles or [0.5, 0.75, 0.95, 0.99]
+            mean = float(sim_ibnr.mean())
+            std = float(sim_ibnr.std())
+            return {
+                "triangle_id": triangle_id,
+                "method": "bootstrap_odp",
+                "n_sims": int(sim_ibnr.size),
+                "mean_ibnr": _clean(mean),
+                "std_ibnr": _clean(std),
+                "cv": _clean(std / mean) if mean else None,
+                "percentiles": {
+                    str(p): _clean(float(np.percentile(sim_ibnr, p * 100)))
+                    for p in pct
+                },
+            }
+        except Exception as exc:
+            logger.exception("bootstrap failed")
+            return {"error": str(exc)}
+
+    # ------------------------------------------------------------------ #
+    # adjustments
+    # ------------------------------------------------------------------ #
+    def berquist_sherman(
+        self,
+        triangle_id: str,
+        paid_amount: str = "Paid",
+        incurred_amount: str = "Incurred",
+        reported_count: str = "Reported",
+        closed_count: str = "Closed",
+        trend: float = 0.0,
+        new_triangle_id: str | None = None,
+    ) -> dict:
+        """Apply the Berquist-Sherman case-reserve/settlement-rate adjustment.
+
+        Restates a multi-column triangle (paid & incurred amounts, reported &
+        closed counts) for changes in case-reserve adequacy and claim settlement
+        rates, then caches the adjusted triangle under a new ``triangle_id`` so it
+        can be reserved with any method (select a ``column``, e.g. 'Incurred').
+        """
+        try:
+            triangle = self._get(triangle_id)
+            adjusted = cl.BerquistSherman(
+                paid_amount=paid_amount,
+                incurred_amount=incurred_amount,
+                reported_count=reported_count,
+                closed_count=closed_count,
+                trend=trend,
+            ).fit_transform(triangle)
+            tid = self._store(adjusted, new_triangle_id)
+            return {"triangle_id": tid, "adjustment": "berquist_sherman",
+                    **self.metadata[tid]}
+        except Exception as exc:
+            logger.exception("berquist_sherman failed")
             return {"error": str(exc)}
 
     # ------------------------------------------------------------------ #
