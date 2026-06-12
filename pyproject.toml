@@ -83,9 +83,20 @@ performance = [
     "dask",  # For distributed computing
     "cupy",  # For GPU acceleration (if available)
 ]
-all = [
-    "chainladder[dev,docs,test]",
+mcp = [
+    "mcp>=1.0",  # Model Context Protocol server and stdio client
 ]
+llm = [
+    "mcp>=1.0",
+    "actllminfer>=0.2",  # actllminfer/actrouter tool-calling bridge (chat agent)
+]
+all = [
+    "chainladder[dev,docs,test,mcp]",
+]
+
+[project.scripts]
+chainladder = "chainladder.cli:main"
+chainladder-mcp = "chainladder.mcp.server:main_sync"
 
 [tool.pytest.ini_options]
 testpaths = ["chainladder", "docs/_ext"]
