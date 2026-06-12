@@ -101,6 +101,54 @@ def test_triangle_from_csv_roundtrip():
     assert "triangle_id" in out or "error" in out
 
 
+def test_change_grain_quarterly_to_yearly():
+    a = ChainladderAgent()
+    a.load_sample("quarterly", "q")
+    out = a.change_grain("q", "OYDY", new_triangle_id="q_yearly")
+    assert out["triangle_id"] == "q_yearly"
+    assert out["origin_grain"] == "Y" and out["development_grain"] == "Y"
+    # the re-grained triangle is usable downstream
+    assert a.development_factors("q_yearly")["ldf"]
+
+
+def test_change_grain_invalid_is_error(agent):
+    assert "error" in agent.change_grain("raa", "OQDQ")  # cannot upsample yearly
+
+
+def test_per_period_average_list_changes_first_ldf(agent):
+    base = agent.development_factors("raa", average="volume")
+    n = 9  # raa has 10 development ages -> 9 link ratios
+    avgs = ["volume"] * n
+    avgs[0] = "simple"
+    custom = agent.development_factors("raa", average=avgs)
+    base_first = list(base["ldf"].values())[0]
+    custom_first = list(custom["ldf"].values())[0]
+    assert custom_first != pytest.approx(base_first)
+
+
+def test_invalid_average_in_list_is_error(agent):
+    assert "error" in agent.development_factors("raa", average=["volume", "bogus"])
+
+
+def test_drop_high_low_changes_factors(agent):
+    base = list(agent.development_factors("raa")["ldf"].values())[0]
+    dropped = list(
+        agent.development_factors("raa", drop_high=True, drop_low=True)["ldf"].values()
+    )[0]
+    assert dropped != pytest.approx(base)
+
+
+def test_drop_specific_point(agent):
+    out = agent.development_factors("raa", drop=[["1982", 12]])
+    assert "error" not in out and out["ldf"]
+
+
+def test_selection_flows_through_to_ibnr(agent):
+    base = agent.ibnr("raa", method="chainladder")["total_ibnr"]
+    selected = agent.ibnr("raa", method="chainladder", drop_high=True)["total_ibnr"]
+    assert selected != pytest.approx(base)
+
+
 def test_all_outputs_json_serializable(agent):
     for payload in (
         agent.list_samples(),

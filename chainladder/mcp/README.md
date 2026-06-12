@@ -3,13 +3,12 @@
 A [Model Context Protocol](https://modelcontextprotocol.io) server, an async
 stdio client, a command-line interface, and an
 [`actllminfer`](https://github.com/jzhng105/actllminfer) / `actrouter`
-tool-calling bridge for the **chainladder** P&C loss-reserving package.
+interop adapter for the **chainladder** P&C loss-reserving package.
 
 ## Install
 
 ```bash
 pip install -e ".[mcp]"     # server + CLI
-pip install -e ".[llm]"     # also installs actllminfer for the chat agent
 ```
 
 Two console scripts are registered:
@@ -28,6 +27,7 @@ Two console scripts are registered:
 | `triangle_from_csv` | Build a triangle from long-format CSV text |
 | `triangle_summary` | Shape, grains, valuation date, latest diagonal |
 | `to_table` | Full triangle as `{origin: {development: value}}` |
+| `change_grain` | Re-aggregate to a new origin/development grain |
 | `link_ratios` | Age-to-age factors and selected LDFs |
 | `development_factors` | LDFs and cumulative development factors (CDFs) |
 | `fit_tail` | Fit a tail curve and report the tail factor |
@@ -36,9 +36,34 @@ Two console scripts are registered:
 | `mack_diagnostics` | Mack stochastic standard error & coefficient of variation |
 
 Reserving methods: `chainladder`, `mack`, `bornhuetter_ferguson`,
-`benktander`, `cape_cod`. The exposure-based methods (BF / Benktander /
-Cape Cod) take an `exposure` (a number, a per-origin list, or a sample name)
-and, where relevant, an `apriori` loss ratio.
+`benktander`, `cape_cod`. The exposure-based methods take an `exposure`
+(a number, a per-origin list, or a sample name) and, where relevant, an
+`apriori` loss ratio.
+
+### Grain
+
+`change_grain` re-aggregates a triangle to a new grain using chainladder's
+`O<x>D<y>` convention (period codes `Y`, `S`, `Q`, `M`), e.g. `OYDY` for
+yearly/yearly or `OQDQ` for quarterly/quarterly. The result is stored under a
+new `triangle_id`.
+
+### Per-period link-ratio selection
+
+Every development-based tool (`link_ratios`, `development_factors`, `fit_tail`,
+`ibnr`, `reserve_summary`, `mack_diagnostics`) accepts actuarial selection
+controls, so you can pick a different basis for a specific development age or
+exclude individual observations:
+
+- `average` — a single method **or a per-development-period list**, e.g.
+  `["simple", "volume", "volume", ...]` to use a simple average at the first
+  age and volume-weighted thereafter.
+- `n_periods` — an integer or a per-age list of how many recent periods to
+  average.
+- `drop` — specific `[origin, age]` link ratios to exclude, e.g.
+  `[["1982", 12]]`.
+- `drop_high` / `drop_low` — exclude the n highest/lowest link ratios at each
+  age (bool, int, or per-age list).
+- `drop_valuation` — exclude a diagonal valuation period, e.g. `"1988"`.
 
 ## CLI
 
@@ -46,13 +71,13 @@ and, where relevant, an `apriori` loss ratio.
 chainladder samples
 chainladder summary raa
 chainladder factors raa --average simple
+chainladder grain quarterly OYDY
 chainladder ibnr raa --method chainladder --summary
 chainladder ibnr raa --method bornhuetter_ferguson --apriori 0.7 --exposure 20000
 chainladder mack raa --tail
 chainladder serve                       # == chainladder-mcp
 chainladder tools                       # list tools through a server subprocess
-chainladder call ibnr --json '{"triangle_id": "raa", "method": "cape_cod", "exposure": 20000}'
-chainladder chat "Estimate IBNR for the raa triangle" --model openai/gpt-4o-mini
+chainladder call development_factors --json '{"triangle_id": "raa", "average": ["simple", "volume", "volume", "volume", "volume", "volume", "volume", "volume", "volume"]}'
 ```
 
 ## Use from an MCP host
@@ -70,35 +95,38 @@ router):
 }
 ```
 
-## actllminfer / actrouter integration
+## actllminfer / actrouter compatibility
 
-The bridge converts the MCP tool schemas into OpenAI-shaped function-calling
-specs and runs a tool-calling loop against the server, so the chainladder tools
-can be driven by any `actllminfer` chat model, its `Router`, or an `actrouter`
-router.
+`actllminfer` (and the `actrouter` router it mirrors) consume tools as
+OpenAI-shaped function-calling specs and return OpenAI-shaped `tool_calls`.
+`chainladder.mcp.bridge` is a small, stateless adapter — no inference loop —
+that converts between those representations so the chainladder tools can be
+wired straight into your own inference call:
 
 ```python
 import asyncio
-from actllminfer import Router
-from chainladder.mcp.bridge import run_agent, mcp_tools_to_openai_specs
+from actllminfer import completion
 from chainladder.mcp.client import ChainladderMCPClient
+from chainladder.mcp.bridge import mcp_tools_to_openai_specs, parse_tool_calls
 
-# 1. Plain provider/model string (dispatched via actllminfer.completion)
-asyncio.run(run_agent(
-    "Estimate IBNR for the raa triangle with the Cape Cod method.",
-    model="anthropic/claude-sonnet-4-6",
-))
 
-# 2. A fallback Router (actllminfer) or an actrouter router — anything with
-#    a .completion(messages=..., tools=...) method is used directly.
-router = Router(["openai/gpt-4o-mini", "kimi/moonshot-v1-8k"])
-asyncio.run(run_agent("Summarise reserve variability for genins.", model=router))
+async def main():
+    async with ChainladderMCPClient() as client:
+        specs = mcp_tools_to_openai_specs(await client.list_tools())
+        resp = completion(
+            model="openai/gpt-4o-mini",
+            messages=[{"role": "user", "content": "Estimate IBNR for raa."}],
+            tools=specs,
+        )
+        for call in parse_tool_calls(resp.choices[0].message):
+            print(await client.call_tool(call["name"], call["args"]))
 
-# 3. Wire the tools into your own inference call.
-async def specs():
-    async with ChainladderMCPClient() as c:
-        return mcp_tools_to_openai_specs(await c.list_tools())
+
+asyncio.run(main())
 ```
+
+Anything exposing a compatible `completion(...)` — `actllminfer.completion`, an
+`actllminfer.Router`, or an `actrouter` router — works the same way.
 
 ## Tests
 

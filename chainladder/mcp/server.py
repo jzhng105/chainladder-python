@@ -47,9 +47,13 @@ def _tool_definitions() -> list[types.Tool]:
         "description": "Averaging method for link-ratio selection.",
     }
     n_periods = {
-        "type": "integer",
+        "anyOf": [
+            {"type": "integer"},
+            {"type": "array", "items": {"type": "integer"}},
+        ],
         "default": -1,
-        "description": "Number of recent periods to average (-1 = all).",
+        "description": "Number of recent periods to average (-1 = all); an "
+        "integer, or a per-development-period list.",
     }
     tail = {"type": "boolean", "default": False, "description": "Apply a fitted tail curve."}
     tail_curve = {
@@ -75,15 +79,57 @@ def _tool_definitions() -> list[types.Tool]:
         "description": "Exposure/premium base for BF, Benktander and Cape Cod: a "
         "number (constant per origin), a per-origin list, or a sample name.",
     }
+    # Per-development-period link-ratio selection controls. ``average`` and
+    # ``n_periods`` above may also be passed as per-age lists.
+    drop = {
+        "type": "array",
+        "items": {"type": "array"},
+        "description": "Specific [origin, age] link ratios to exclude, e.g. "
+        "[[\"1982\", 12]].",
+    }
+    _bool_int_list = [
+        {"type": "boolean"}, {"type": "integer"},
+        {"type": "array", "items": {"type": ["boolean", "integer"]}},
+    ]
+    drop_high = {
+        "anyOf": _bool_int_list,
+        "description": "Exclude the n highest link ratios at each age (bool, int, "
+        "or per-age list).",
+    }
+    drop_low = {
+        "anyOf": _bool_int_list,
+        "description": "Exclude the n lowest link ratios at each age (bool, int, "
+        "or per-age list).",
+    }
+    drop_valuation = {
+        "description": "Diagonal valuation period(s) to exclude, e.g. \"1988\".",
+    }
+    _avg_enum = ["volume", "simple", "regression", "geometric"]
+    average_or_list = {
+        "anyOf": [
+            {"type": "string", "enum": _avg_enum},
+            {"type": "array", "items": {"type": "string", "enum": _avg_enum}},
+        ],
+        "default": "volume",
+        "description": "Averaging method, or a per-development-period list "
+        "(e.g. [\"volume\", \"simple\", ...]) to select an average per age.",
+    }
+    selection_props = {
+        "drop": drop,
+        "drop_high": drop_high,
+        "drop_low": drop_low,
+        "drop_valuation": drop_valuation,
+    }
     reserve_props = {
         "triangle_id": {"type": "string", "description": "Cached triangle id."},
         "method": method,
         "n_periods": n_periods,
-        "average": average,
+        "average": average_or_list,
         "tail": tail,
         "tail_curve": tail_curve,
         "apriori": apriori,
         "exposure": exposure,
+        **selection_props,
     }
 
     return [
@@ -140,6 +186,22 @@ def _tool_definitions() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="change_grain",
+            description="Re-aggregate a triangle to a new origin/development grain "
+            "(e.g. 'OYDY', 'OQDQ'); stored under a new triangle_id.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "triangle_id": {"type": "string"},
+                    "grain": {"type": "string", "description": "Target grain, e.g. 'OYDY'."},
+                    "trailing": {"type": "boolean", "default": False,
+                                 "description": "Align periods to the valuation date."},
+                    "new_triangle_id": {"type": "string", "description": "Optional cache id."},
+                },
+                "required": ["triangle_id", "grain"],
+            },
+        ),
+        types.Tool(
             name="link_ratios",
             description="Age-to-age (link ratio) factors plus the selected LDFs.",
             inputSchema={
@@ -147,7 +209,8 @@ def _tool_definitions() -> list[types.Tool]:
                 "properties": {
                     "triangle_id": {"type": "string"},
                     "n_periods": n_periods,
-                    "average": average,
+                    "average": average_or_list,
+                    **selection_props,
                 },
                 "required": ["triangle_id"],
             },
@@ -160,7 +223,8 @@ def _tool_definitions() -> list[types.Tool]:
                 "properties": {
                     "triangle_id": {"type": "string"},
                     "n_periods": n_periods,
-                    "average": average,
+                    "average": average_or_list,
+                    **selection_props,
                 },
                 "required": ["triangle_id"],
             },
@@ -174,7 +238,8 @@ def _tool_definitions() -> list[types.Tool]:
                     "triangle_id": {"type": "string"},
                     "curve": tail_curve,
                     "n_periods": n_periods,
-                    "average": average,
+                    "average": average_or_list,
+                    **selection_props,
                 },
                 "required": ["triangle_id"],
             },
@@ -205,9 +270,10 @@ def _tool_definitions() -> list[types.Tool]:
                 "properties": {
                     "triangle_id": {"type": "string"},
                     "n_periods": n_periods,
-                    "average": average,
+                    "average": average_or_list,
                     "tail": tail,
                     "tail_curve": tail_curve,
+                    **selection_props,
                 },
                 "required": ["triangle_id"],
             },
@@ -223,6 +289,7 @@ def _dispatch():
         "triangle_from_csv": agent.triangle_from_csv,
         "triangle_summary": agent.triangle_summary,
         "to_table": agent.to_table,
+        "change_grain": agent.change_grain,
         "link_ratios": agent.link_ratios,
         "development_factors": agent.development_factors,
         "fit_tail": agent.fit_tail,

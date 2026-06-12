@@ -44,6 +44,20 @@ _METHODS = {
 
 _AVERAGES = ("volume", "simple", "regression", "geometric")
 _CURVES = ("exponential", "inverse_power")
+_GRAINS = ("Y", "S", "Q", "M")
+
+
+def _norm_drop(drop):
+    """Normalise a JSON ``drop`` argument into chainladder's tuple form.
+
+    Accepts a single ``[origin, age]`` pair or a list of such pairs (JSON has no
+    tuples) and returns a tuple / list-of-tuples, or ``None``.
+    """
+    if not drop:
+        return None
+    if isinstance(drop[0], (list, tuple)):
+        return [tuple(pair) for pair in drop]
+    return tuple(drop)
 
 
 def _clean(value: Any) -> Any:
@@ -208,17 +222,48 @@ class ChainladderAgent:
         except Exception as exc:
             return {"error": str(exc)}
 
+    def change_grain(
+        self,
+        triangle_id: str,
+        grain: str,
+        trailing: bool = False,
+        new_triangle_id: str | None = None,
+    ) -> dict:
+        """Re-aggregate a triangle to a new origin/development grain.
+
+        ``grain`` follows chainladder's ``O<x>D<y>`` convention, e.g. ``'OYDY'``
+        (yearly origin, yearly development) or ``'OQDQ'`` (quarterly/quarterly).
+        Valid period codes are Y, S, Q, M. The re-grained triangle is stored
+        under a new ``triangle_id``.
+        """
+        try:
+            triangle = self._get(triangle_id)
+            regrained = triangle.grain(grain, trailing=trailing)
+            tid = self._store(regrained, new_triangle_id)
+            return {"triangle_id": tid, "grain": grain, **self.metadata[tid]}
+        except Exception as exc:
+            logger.exception("change_grain failed")
+            return {"error": str(exc)}
+
     # ------------------------------------------------------------------ #
     # development
     # ------------------------------------------------------------------ #
     def link_ratios(
-        self, triangle_id: str, n_periods: int = -1, average: str = "volume"
+        self,
+        triangle_id: str,
+        n_periods=-1,
+        average="volume",
+        drop=None,
+        drop_high=None,
+        drop_low=None,
+        drop_valuation=None,
     ) -> dict:
         """Age-to-age (link ratio) factors plus the selected LDFs."""
         try:
-            self._validate_average(average)
             triangle = self._get(triangle_id)
-            dev = cl.Development(n_periods=n_periods, average=average).fit(triangle)
+            dev = self._development(
+                n_periods, average, drop, drop_high, drop_low, drop_valuation,
+            ).fit(triangle)
             return {
                 "triangle_id": triangle_id,
                 "average": average,
@@ -234,13 +279,21 @@ class ChainladderAgent:
             return {"error": str(exc)}
 
     def development_factors(
-        self, triangle_id: str, n_periods: int = -1, average: str = "volume"
+        self,
+        triangle_id: str,
+        n_periods=-1,
+        average="volume",
+        drop=None,
+        drop_high=None,
+        drop_low=None,
+        drop_valuation=None,
     ) -> dict:
         """Selected LDFs and the cumulative development factors (CDFs)."""
         try:
-            self._validate_average(average)
             triangle = self._get(triangle_id)
-            dev = cl.Development(n_periods=n_periods, average=average).fit(triangle)
+            dev = self._development(
+                n_periods, average, drop, drop_high, drop_low, drop_valuation,
+            ).fit(triangle)
             ages = [str(c) for c in dev.ldf_.development.tolist()]
             return {
                 "triangle_id": triangle_id,
@@ -257,17 +310,21 @@ class ChainladderAgent:
         self,
         triangle_id: str,
         curve: str = "exponential",
-        n_periods: int = -1,
-        average: str = "volume",
+        n_periods=-1,
+        average="volume",
+        drop=None,
+        drop_high=None,
+        drop_low=None,
+        drop_valuation=None,
     ) -> dict:
         """Fit a tail curve to the development pattern and report the tail factor."""
         try:
-            self._validate_average(average)
             if curve not in _CURVES:
                 return {"error": f"curve must be one of {list(_CURVES)}"}
             triangle = self._get(triangle_id)
             pipe = cl.Pipeline([
-                ("dev", cl.Development(n_periods=n_periods, average=average)),
+                ("dev", self._development(
+                    n_periods, average, drop, drop_high, drop_low, drop_valuation)),
                 ("tail", cl.TailCurve(curve=curve)),
             ]).fit(triangle)
             tail = pipe.named_steps.tail
@@ -291,14 +348,13 @@ class ChainladderAgent:
         self,
         triangle: cl.Triangle,
         method: str,
-        n_periods: int,
-        average: str,
         tail: bool,
         tail_curve: str,
         apriori: float,
         exposure: float | list | str | None,
+        dev_kwargs: dict,
     ):
-        steps = [("dev", cl.Development(n_periods=n_periods, average=average))]
+        steps = [("dev", self._development(**dev_kwargs))]
         if tail:
             steps.append(("tail", cl.TailCurve(curve=tail_curve)))
 
@@ -331,22 +387,27 @@ class ChainladderAgent:
         self,
         triangle_id: str,
         method: str = "chainladder",
-        n_periods: int = -1,
-        average: str = "volume",
+        n_periods=-1,
+        average="volume",
         tail: bool = False,
         tail_curve: str = "exponential",
         apriori: float = 1.0,
         exposure: float | list | str | None = None,
+        drop=None,
+        drop_high=None,
+        drop_low=None,
+        drop_valuation=None,
     ) -> dict:
         """Run a reserving method and return ultimate / IBNR totals and by-origin."""
         try:
             if method not in _METHODS:
                 return {"error": f"method must be one of {list(_METHODS)}"}
-            self._validate_average(average)
             triangle = self._get(triangle_id)
             model = self._build_model(
-                triangle, method, n_periods, average, tail, tail_curve,
-                apriori, exposure,
+                triangle, method, tail, tail_curve, apriori, exposure,
+                dict(n_periods=n_periods, average=average, drop=drop,
+                     drop_high=drop_high, drop_low=drop_low,
+                     drop_valuation=drop_valuation),
             )
             return {
                 "triangle_id": triangle_id,
@@ -365,22 +426,27 @@ class ChainladderAgent:
         self,
         triangle_id: str,
         method: str = "chainladder",
-        n_periods: int = -1,
-        average: str = "volume",
+        n_periods=-1,
+        average="volume",
         tail: bool = False,
         tail_curve: str = "exponential",
         apriori: float = 1.0,
         exposure: float | list | str | None = None,
+        drop=None,
+        drop_high=None,
+        drop_low=None,
+        drop_valuation=None,
     ) -> dict:
         """Full by-origin reserve table: latest, ultimate and IBNR side by side."""
         try:
             if method not in _METHODS:
                 return {"error": f"method must be one of {list(_METHODS)}"}
-            self._validate_average(average)
             triangle = self._get(triangle_id)
             model = self._build_model(
-                triangle, method, n_periods, average, tail, tail_curve,
-                apriori, exposure,
+                triangle, method, tail, tail_curve, apriori, exposure,
+                dict(n_periods=n_periods, average=average, drop=drop,
+                     drop_high=drop_high, drop_low=drop_low,
+                     drop_valuation=drop_valuation),
             )
             latest = self._origin_vector(triangle.latest_diagonal)
             ultimate = self._origin_vector(model.ultimate_)
@@ -410,17 +476,23 @@ class ChainladderAgent:
     def mack_diagnostics(
         self,
         triangle_id: str,
-        n_periods: int = -1,
-        average: str = "volume",
+        n_periods=-1,
+        average="volume",
         tail: bool = False,
         tail_curve: str = "exponential",
+        drop=None,
+        drop_high=None,
+        drop_low=None,
+        drop_valuation=None,
     ) -> dict:
         """Mack chain-ladder stochastic diagnostics (standard error & CoV)."""
         try:
-            self._validate_average(average)
             triangle = self._get(triangle_id)
             model = self._build_model(
-                triangle, "mack", n_periods, average, tail, tail_curve, 1.0, None,
+                triangle, "mack", tail, tail_curve, 1.0, None,
+                dict(n_periods=n_periods, average=average, drop=drop,
+                     drop_high=drop_high, drop_low=drop_low,
+                     drop_valuation=drop_valuation),
             )
             total_ibnr = float(model.ibnr_.sum())
             total_se = float(model.total_mack_std_err_.values.ravel()[0])
@@ -437,6 +509,34 @@ class ChainladderAgent:
 
     # ------------------------------------------------------------------ #
     @staticmethod
-    def _validate_average(average: str) -> None:
-        if average not in _AVERAGES:
-            raise ValueError(f"average must be one of {list(_AVERAGES)}")
+    def _validate_average(average) -> None:
+        values = average if isinstance(average, (list, tuple)) else [average]
+        for value in values:
+            if value not in _AVERAGES:
+                raise ValueError(f"average must be one of {list(_AVERAGES)}")
+
+    def _development(
+        self,
+        n_periods=-1,
+        average="volume",
+        drop=None,
+        drop_high=None,
+        drop_low=None,
+        drop_valuation=None,
+    ) -> "cl.Development":
+        """Build a ``Development`` transformer with per-period selection options.
+
+        ``average`` and ``n_periods`` may be a single value or a per-development
+        list; ``drop`` removes specific ``[origin, age]`` link ratios, while
+        ``drop_high`` / ``drop_low`` / ``drop_valuation`` exclude extreme or
+        dated observations from each age's average.
+        """
+        self._validate_average(average)
+        return cl.Development(
+            n_periods=n_periods,
+            average=average,
+            drop=_norm_drop(drop),
+            drop_high=drop_high,
+            drop_low=drop_low,
+            drop_valuation=drop_valuation,
+        )

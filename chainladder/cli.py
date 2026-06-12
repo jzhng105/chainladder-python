@@ -15,7 +15,6 @@ actrouter agent::
     chainladder serve                        # run the MCP server (stdio)
     chainladder tools                        # list MCP tools (via a subprocess)
     chainladder call ibnr --json '{"triangle_id": "raa", ...}'
-    chainladder chat "Estimate IBNR for the raa triangle" --model openai/gpt-4o-mini
 
 ``serve`` is equivalent to the ``chainladder-mcp`` entry point.
 """
@@ -25,7 +24,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import sys
 
 from chainladder.mcp.agent import ChainladderAgent
 
@@ -87,6 +85,13 @@ def _cmd_mack(args) -> int:
     return 0
 
 
+def _cmd_grain(args) -> int:
+    agent = ChainladderAgent()
+    agent.load_sample(args.sample, args.sample)
+    _print(agent.change_grain(args.sample, args.grain, trailing=args.trailing))
+    return 0
+
+
 def _parse_exposure(value):
     if value is None:
         return None
@@ -135,18 +140,6 @@ def _cmd_call(args) -> int:
             return await client.call_tool(args.tool, arguments)
 
     _print(asyncio.run(_run()))
-    return 0
-
-
-def _cmd_chat(args) -> int:
-    from chainladder.mcp.bridge import run_agent
-
-    result = asyncio.run(run_agent(args.prompt, model=args.model,
-                                   max_steps=args.max_steps))
-    print(result["answer"])
-    if args.verbose:
-        print("\n--- tool calls ---", file=sys.stderr)
-        _print(result["tool_results"])
     return 0
 
 
@@ -212,13 +205,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", help="Tool arguments as a JSON object.")
     p.set_defaults(func=_cmd_call)
 
-    p = sub.add_parser("chat", help="Run the actllminfer/actrouter tool-calling agent.")
-    p.add_argument("prompt")
-    p.add_argument("--model", default="openai/gpt-4o-mini",
-                   help="actllminfer provider/model string.")
-    p.add_argument("--max-steps", type=int, default=8, dest="max_steps")
-    p.add_argument("--verbose", action="store_true")
-    p.set_defaults(func=_cmd_chat)
+    p = sub.add_parser("grain", help="Re-aggregate a sample triangle to a new grain.")
+    p.add_argument("sample")
+    p.add_argument("grain", help="Target grain, e.g. OYDY or OQDQ.")
+    p.add_argument("--trailing", action="store_true")
+    p.set_defaults(func=_cmd_grain)
 
     return parser
 
