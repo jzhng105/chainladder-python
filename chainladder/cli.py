@@ -66,10 +66,35 @@ def _reserve(args, full: bool) -> int:
         average=args.average,
         tail=args.tail,
         tail_curve=args.tail_curve,
+        tail_factor=args.tail_factor,
         apriori=args.apriori,
         exposure=_parse_exposure(args.exposure),
+        method_params=json.loads(args.method_params) if args.method_params else None,
         column=args.column,
     ))
+    return 0
+
+
+def _cmd_munich(args) -> int:
+    agent = ChainladderAgent()
+    agent.load_sample(args.sample, args.sample)
+    _print(agent.munich_adjustment(args.sample, paid=args.paid, incurred=args.incurred))
+    return 0
+
+
+def _cmd_voting(args) -> int:
+    agent = ChainladderAgent()
+    agent.load_sample(args.sample, args.sample)
+    estimators = json.loads(args.estimators) if args.estimators else None
+    _print(agent.voting_reserve(args.sample, estimators=estimators,
+                                exposure=_parse_exposure(args.exposure)))
+    return 0
+
+
+def _cmd_correlation(args) -> int:
+    agent = ChainladderAgent()
+    agent.load_sample(args.sample, args.sample)
+    _print(agent.correlation_tests(args.sample, column=args.column))
     return 0
 
 
@@ -168,7 +193,8 @@ def _cmd_call(args) -> int:
 # --------------------------------------------------------------------------- #
 _RESERVE_METHODS = [
     "chainladder", "mack", "bornhuetter_ferguson", "benktander", "cape_cod",
-    "expected_loss", "incremental_additive", "clark_ldf",
+    "expected_loss", "incremental_additive", "clark_ldf", "glm",
+    "barnett_zehnwirth", "development_constant",
 ]
 
 
@@ -178,12 +204,17 @@ def _add_reserve_args(parser) -> None:
     parser.add_argument("--n-periods", type=int, default=-1, dest="n_periods")
     parser.add_argument("--average", default="volume",
                         choices=["volume", "simple", "regression", "geometric"])
-    parser.add_argument("--tail", action="store_true", help="Apply a tail curve.")
+    parser.add_argument("--tail", default="none", dest="tail",
+                        choices=["none", "curve", "constant", "bondy", "clark"],
+                        help="Tail method.")
     parser.add_argument("--tail-curve", default="exponential", dest="tail_curve",
                         choices=["exponential", "inverse_power"])
+    parser.add_argument("--tail-factor", type=float, default=1.0, dest="tail_factor")
     parser.add_argument("--apriori", type=float, default=1.0)
     parser.add_argument("--exposure", default=None,
                         help="Number, JSON list, or sample name (exposure-based methods).")
+    parser.add_argument("--method-params", default=None, dest="method_params",
+                        help="JSON of method-specific options (glm/bz/clark/dev_constant).")
     parser.add_argument("--column", default=None,
                         help="Measure column for a multi-column triangle.")
 
@@ -237,6 +268,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--method", default="chainladder", choices=_RESERVE_METHODS)
     p.add_argument("--column", default="Incurred")
     p.set_defaults(func=_cmd_berquist_sherman)
+
+    p = sub.add_parser("munich", help="Munich chain ladder (paid & incurred).")
+    p.add_argument("sample")
+    p.add_argument("--paid", default="paid")
+    p.add_argument("--incurred", default="incurred")
+    p.set_defaults(func=_cmd_munich)
+
+    p = sub.add_parser("voting", help="Weighted ensemble of reserving methods.")
+    p.add_argument("sample")
+    p.add_argument("--estimators", default=None,
+                   help='JSON list, e.g. \'[{"method":"chainladder","weight":0.5},'
+                        '{"method":"cape_cod","weight":0.5}]\'.')
+    p.add_argument("--exposure", default=None)
+    p.set_defaults(func=_cmd_voting)
+
+    p = sub.add_parser("correlation", help="Mack development/valuation correlation tests.")
+    p.add_argument("sample")
+    p.add_argument("--column", default=None)
+    p.set_defaults(func=_cmd_correlation)
 
     sub.add_parser("serve", help="Run the MCP server over stdio.").set_defaults(
         func=_cmd_serve)

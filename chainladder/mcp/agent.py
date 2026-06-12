@@ -44,10 +44,21 @@ _METHODS = {
     "expected_loss": {"exposure": True, "exposure_on": "model"},
     "incremental_additive": {"exposure": True, "exposure_on": "dev"},
     "clark_ldf": {"exposure": False},
+    "glm": {"exposure": False},
+    "barnett_zehnwirth": {"exposure": False},
+    "development_constant": {"exposure": False},
+}
+
+# Methods whose development step is *not* the standard volume/average
+# ``Development`` transformer (so per-period average/drop selection is ignored).
+_SELF_PATTERN_METHODS = {
+    "clark_ldf", "glm", "barnett_zehnwirth", "development_constant",
 }
 
 _AVERAGES = ("volume", "simple", "regression", "geometric")
 _CURVES = ("exponential", "inverse_power")
+_TAILS = ("none", "curve", "constant", "bondy", "clark")
+_GROWTH = ("loglogistic", "weibull")
 _GRAINS = ("Y", "S", "Q", "M")
 
 
@@ -343,7 +354,9 @@ class ChainladderAgent:
     def fit_tail(
         self,
         triangle_id: str,
+        method: str = "curve",
         curve: str = "exponential",
+        tail_factor: float = 1.0,
         n_periods=-1,
         average="volume",
         drop=None,
@@ -352,20 +365,25 @@ class ChainladderAgent:
         drop_valuation=None,
         column=None,
     ) -> dict:
-        """Fit a tail curve to the development pattern and report the tail factor."""
+        """Fit a tail and report its factor and the extended CDFs.
+
+        ``method`` is one of 'curve' (exponential/inverse-power extrapolation),
+        'constant' (a user ``tail_factor``), 'bondy', or 'clark'.
+        """
         try:
-            if curve not in _CURVES:
-                return {"error": f"curve must be one of {list(_CURVES)}"}
+            tail_step = self._tail_step(method, curve, tail_factor)
+            if tail_step is None:
+                return {"error": f"method must be one of {list(_TAILS[1:])}"}
             triangle = self._prepare(self._get(triangle_id), column)
             pipe = cl.Pipeline([
                 ("dev", self._development(
                     n_periods, average, drop, drop_high, drop_low, drop_valuation)),
-                ("tail", cl.TailCurve(curve=curve)),
+                ("tail", tail_step),
             ]).fit(triangle)
             tail = pipe.named_steps.tail
             return {
                 "triangle_id": triangle_id,
-                "curve": curve,
+                "method": method,
                 "tail_factor": _clean(float(tail.tail_.values.ravel()[0])),
                 "cdf_with_tail": _clean(dict(zip(
                     [str(c) for c in tail.cdf_.development.tolist()],
@@ -379,11 +397,35 @@ class ChainladderAgent:
     # ------------------------------------------------------------------ #
     # reserving
     # ------------------------------------------------------------------ #
-    def _dev_step(self, method: str, dev_kwargs: dict):
-        """The development transformer for a method (Clark and the additive
-        method bring their own patterns; everything else uses ``Development``)."""
+    def _dev_step(self, method: str, dev_kwargs: dict, method_params: dict):
+        """The development transformer for a method.
+
+        Clark, the GLM, Barnett-Zehnwirth and the additive method bring their own
+        patterns; ``development_constant`` applies user-supplied factors; every
+        other method uses the standard ``Development`` transformer.
+        """
+        mp = method_params or {}
         if method == "clark_ldf":
-            return cl.ClarkLDF()
+            return cl.ClarkLDF(growth=mp.get("growth", "loglogistic"))
+        if method == "glm":
+            return cl.TweedieGLM(
+                power=mp.get("power", 1.0),
+                design_matrix=mp.get(
+                    "design_matrix", "C(development) + C(origin)"),
+                link=mp.get("link", "log"),
+            )
+        if method == "barnett_zehnwirth":
+            return cl.BarnettZehnwirth(
+                formula=mp.get("formula", "C(origin) + C(development)"))
+        if method == "development_constant":
+            patterns = mp.get("patterns")
+            if not patterns:
+                raise ValueError(
+                    "development_constant requires 'patterns' "
+                    "({development_age: factor}) in method_params.")
+            patterns = {int(k): float(v) for k, v in patterns.items()}
+            return cl.DevelopmentConstant(
+                patterns=patterns, style=mp.get("style", "ldf"))
         if method == "incremental_additive":
             return cl.IncrementalAdditive(
                 n_periods=dev_kwargs["n_periods"],
@@ -395,29 +437,61 @@ class ChainladderAgent:
             )
         return self._development(**dev_kwargs)
 
+    @staticmethod
+    def _tail_step(tail, tail_curve: str, tail_factor: float):
+        """Resolve the tail estimator (or ``None``) from a tail specification.
+
+        ``tail`` may be a bool (``True`` -> exponential/inverse-power curve) or
+        one of 'none', 'curve', 'constant', 'bondy', 'clark'.
+        """
+        if tail is True:
+            tail = "curve"
+        if not tail or tail == "none":
+            return None
+        if tail not in _TAILS:
+            raise ValueError(f"tail must be a bool or one of {list(_TAILS)}")
+        if tail == "curve":
+            if tail_curve not in _CURVES:
+                raise ValueError(f"tail_curve must be one of {list(_CURVES)}")
+            return cl.TailCurve(curve=tail_curve)
+        if tail == "constant":
+            return cl.TailConstant(tail=tail_factor)
+        if tail == "bondy":
+            return cl.TailBondy()
+        return cl.TailClark()
+
     def _build_model(
         self,
         triangle: cl.Triangle,
         method: str,
-        tail: bool,
+        tail,
         tail_curve: str,
         apriori: float,
         exposure: float | list | str | None,
         dev_kwargs: dict,
+        method_params: dict | None = None,
+        tail_factor: float = 1.0,
     ):
         if method not in _METHODS:  # pragma: no cover - guarded by caller
             raise ValueError(f"Unknown method '{method}'")
-        self._validate_average(dev_kwargs["average"])
+        if method not in _SELF_PATTERN_METHODS:
+            self._validate_average(dev_kwargs["average"])
 
-        steps = [("dev", self._dev_step(method, dev_kwargs))]
-        if tail and method not in ("clark_ldf",):
-            steps.append(("tail", cl.TailCurve(curve=tail_curve)))
+        steps = [("dev", self._dev_step(method, dev_kwargs, method_params))]
+        # Clark's growth curve already extrapolates a tail.
+        tail_step = None if method == "clark_ldf" else self._tail_step(
+            tail, tail_curve, tail_factor)
+        if tail_step is not None:
+            steps.append(("tail", tail_step))
 
         models = {
             "chainladder": lambda: cl.Chainladder(),
             "mack": lambda: cl.MackChainladder(),
             "incremental_additive": lambda: cl.Chainladder(),
             "clark_ldf": lambda: cl.Chainladder(),
+            "glm": lambda: cl.Chainladder(),
+            "barnett_zehnwirth": lambda: cl.Chainladder(),
+            "development_constant": lambda: cl.Chainladder(),
             "bornhuetter_ferguson": lambda: cl.BornhuetterFerguson(apriori=apriori),
             "benktander": lambda: cl.Benktander(apriori=apriori, n_iters=2),
             "cape_cod": lambda: cl.CapeCod(),
@@ -441,14 +515,16 @@ class ChainladderAgent:
         method: str = "chainladder",
         n_periods=-1,
         average="volume",
-        tail: bool = False,
+        tail=False,
         tail_curve: str = "exponential",
+        tail_factor: float = 1.0,
         apriori: float = 1.0,
         exposure: float | list | str | None = None,
         drop=None,
         drop_high=None,
         drop_low=None,
         drop_valuation=None,
+        method_params: dict | None = None,
         column=None,
     ) -> dict:
         """Run a reserving method and return ultimate / IBNR totals and by-origin."""
@@ -461,6 +537,7 @@ class ChainladderAgent:
                 dict(n_periods=n_periods, average=average, drop=drop,
                      drop_high=drop_high, drop_low=drop_low,
                      drop_valuation=drop_valuation),
+                method_params=method_params, tail_factor=tail_factor,
             )
             return {
                 "triangle_id": triangle_id,
@@ -481,14 +558,16 @@ class ChainladderAgent:
         method: str = "chainladder",
         n_periods=-1,
         average="volume",
-        tail: bool = False,
+        tail=False,
         tail_curve: str = "exponential",
+        tail_factor: float = 1.0,
         apriori: float = 1.0,
         exposure: float | list | str | None = None,
         drop=None,
         drop_high=None,
         drop_low=None,
         drop_valuation=None,
+        method_params: dict | None = None,
         column=None,
     ) -> dict:
         """Full by-origin reserve table: latest, ultimate and IBNR side by side."""
@@ -501,6 +580,7 @@ class ChainladderAgent:
                 dict(n_periods=n_periods, average=average, drop=drop,
                      drop_high=drop_high, drop_low=drop_low,
                      drop_valuation=drop_valuation),
+                method_params=method_params, tail_factor=tail_factor,
             )
             latest = self._origin_vector(triangle.latest_diagonal)
             ultimate = self._origin_vector(model.ultimate_)
@@ -532,8 +612,9 @@ class ChainladderAgent:
         triangle_id: str,
         n_periods=-1,
         average="volume",
-        tail: bool = False,
+        tail=False,
         tail_curve: str = "exponential",
+        tail_factor: float = 1.0,
         drop=None,
         drop_high=None,
         drop_low=None,
@@ -548,6 +629,7 @@ class ChainladderAgent:
                 dict(n_periods=n_periods, average=average, drop=drop,
                      drop_high=drop_high, drop_low=drop_low,
                      drop_valuation=drop_valuation),
+                tail_factor=tail_factor,
             )
             total_ibnr = float(model.ibnr_.sum())
             total_se = float(model.total_mack_std_err_.values.ravel()[0])
@@ -638,6 +720,159 @@ class ChainladderAgent:
                     **self.metadata[tid]}
         except Exception as exc:
             logger.exception("berquist_sherman failed")
+            return {"error": str(exc)}
+
+    def munich_adjustment(
+        self,
+        triangle_id: str,
+        paid: str = "paid",
+        incurred: str = "incurred",
+    ) -> dict:
+        """Munich chain ladder: jointly develop paid and incurred triangles.
+
+        Reconciles the paid and incurred projections using their historical
+        correlation, returning ultimates and IBNR for both bases. Requires a
+        two-column (paid & incurred) triangle such as the 'mcl' sample.
+        """
+        try:
+            triangle = self._get(triangle_id)
+            if paid not in triangle.columns or incurred not in triangle.columns:
+                return {"error": f"Triangle must contain '{paid}' and '{incurred}' "
+                        f"columns. Available: {list(triangle.columns)}"}
+            if triangle.shape[0] > 1:
+                triangle = triangle.sum("index")
+            model = cl.Pipeline([
+                ("munich", cl.MunichAdjustment(paid_to_incurred=(paid, incurred))),
+                ("model", cl.Chainladder()),
+            ]).fit(triangle).named_steps.model
+            out = {"triangle_id": triangle_id, "method": "munich"}
+            for base in (paid, incurred):
+                out[base] = {
+                    "total_ultimate": _clean(float(model.ultimate_[base].sum())),
+                    "total_ibnr": _clean(float(model.ibnr_[base].sum())),
+                    "ultimate_by_origin": self._origin_vector(model.ultimate_[base]),
+                }
+            return out
+        except Exception as exc:
+            logger.exception("munich_adjustment failed")
+            return {"error": str(exc)}
+
+    def voting_reserve(
+        self,
+        triangle_id: str,
+        estimators: list | None = None,
+        exposure: float | list | str | None = None,
+        column=None,
+    ) -> dict:
+        """Weighted ensemble ("voting") of reserving methods.
+
+        ``estimators`` is a list of ``{"method": ..., "weight": ..., "apriori": ...}``
+        entries; weights are normalised and applied across all origins. Any
+        exposure-based component (BF, Cape Cod, ...) uses the supplied ``exposure``.
+        """
+        try:
+            estimators = estimators or [
+                {"method": "chainladder", "weight": 0.5},
+                {"method": "bornhuetter_ferguson", "weight": 0.5, "apriori": 0.7},
+            ]
+            triangle = self._prepare(self._get(triangle_id), column)
+            built, weights, needs_exposure = [], [], False
+            for i, spec in enumerate(estimators):
+                name = spec.get("method")
+                if name not in _METHODS:
+                    return {"error": f"method must be one of {list(_METHODS)}"}
+                estimator = self._voting_estimator(name, spec.get("apriori", 1.0))
+                built.append((spec.get("name", f"{name}_{i}"), estimator))
+                weights.append(float(spec.get("weight", 1.0)))
+                needs_exposure = needs_exposure or _METHODS[name]["exposure"]
+            weights = np.asarray(weights, dtype=float)
+            weights = weights / weights.sum()
+            n_origin = triangle.shape[2]
+            weight_matrix = np.tile(weights, (n_origin, 1))
+
+            voter = cl.VotingChainladder(estimators=built, weights=weight_matrix)
+            if needs_exposure:
+                voter.fit(triangle, sample_weight=self._exposure_triangle(triangle, exposure))
+            else:
+                voter.fit(triangle)
+            return {
+                "triangle_id": triangle_id,
+                "method": "voting",
+                "components": [{"method": s.get("method"),
+                                "weight": _clean(float(w))}
+                               for s, w in zip(estimators, weights)],
+                "total_ultimate": _clean(float(voter.ultimate_.sum())),
+                "total_ibnr": _clean(float(voter.ibnr_.sum())),
+                "ibnr_by_origin": self._origin_vector(voter.ibnr_),
+            }
+        except Exception as exc:
+            logger.exception("voting_reserve failed")
+            return {"error": str(exc)}
+
+    @staticmethod
+    def _voting_estimator(method: str, apriori: float):
+        builders = {
+            "chainladder": lambda: cl.Chainladder(),
+            "bornhuetter_ferguson": lambda: cl.BornhuetterFerguson(apriori=apriori),
+            "benktander": lambda: cl.Benktander(apriori=apriori, n_iters=2),
+            "cape_cod": lambda: cl.CapeCod(),
+            "expected_loss": lambda: cl.ExpectedLoss(apriori=apriori),
+        }
+        if method not in builders:
+            raise ValueError(
+                f"voting supports {list(builders)}; got '{method}'.")
+        return builders[method]()
+
+    def correlation_tests(self, triangle_id: str, column=None) -> dict:
+        """Mack's development and valuation correlation diagnostics.
+
+        Tests the chain-ladder independence assumptions: correlation between
+        adjacent development factors, and calendar-period (valuation) effects.
+        """
+        def _scalar(x):
+            return float(np.asarray(getattr(x, "values", x)).ravel()[0])
+
+        try:
+            triangle = self._prepare(self._get(triangle_id), column)
+            dev = cl.DevelopmentCorrelation(triangle)
+            val = cl.ValuationCorrelation(triangle, total=True)
+            z = _scalar(val.z)
+            lower, upper = float(val.range[0].ravel()[0]), float(val.range[1].ravel()[0])
+            return {
+                "triangle_id": triangle_id,
+                "development_correlation": {
+                    "reject_independence": bool(_scalar(dev.reject)),
+                    "description": "Tests correlation between adjacent development "
+                    "factors (Mack). True => the independence assumption is violated.",
+                },
+                "valuation_correlation": {
+                    "z": _clean(z),
+                    "range": [_clean(lower), _clean(upper)],
+                    "significant_calendar_effect": bool(z < lower or z > upper),
+                    "description": "Tests for calendar-period (diagonal) effects "
+                    "(Mack). Significant => a calendar-year trend is present.",
+                },
+            }
+        except Exception as exc:
+            logger.exception("correlation_tests failed")
+            return {"error": str(exc)}
+
+    def apply_trend(
+        self,
+        triangle_id: str,
+        trend: float = 0.0,
+        axis: str = "origin",
+        new_triangle_id: str | None = None,
+    ) -> dict:
+        """Apply an annual compound trend along an axis and cache the result."""
+        try:
+            triangle = self._get(triangle_id)
+            trended = cl.Trend(trends=trend, axis=axis).fit_transform(triangle)
+            tid = self._store(trended, new_triangle_id)
+            return {"triangle_id": tid, "trend": trend, "axis": axis,
+                    **self.metadata[tid]}
+        except Exception as exc:
+            logger.exception("apply_trend failed")
             return {"error": str(exc)}
 
     # ------------------------------------------------------------------ #

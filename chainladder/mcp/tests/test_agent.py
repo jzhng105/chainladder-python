@@ -217,6 +217,98 @@ def test_multidim_summary_has_note():
     assert "note" in summary and "latest_diagonal" not in summary
 
 
+@pytest.mark.parametrize("tail,extra", [
+    ("curve", {}),
+    ("constant", {"tail_factor": 1.05}),
+    ("bondy", {}),
+    ("clark", {}),
+])
+def test_all_tail_methods(agent, tail, extra):
+    out = agent.ibnr("raa", method="chainladder", tail=tail, **extra)
+    assert "error" not in out
+    # a tail lifts the ultimate above the no-tail result
+    base = agent.ibnr("raa", method="chainladder")["total_ultimate"]
+    assert out["total_ultimate"] >= base
+
+
+def test_fit_tail_bondy(agent):
+    out = agent.fit_tail("raa", method="bondy")
+    assert out["method"] == "bondy" and out["tail_factor"] > 1.0
+
+
+def test_constant_tail_uses_factor(agent):
+    out = agent.ibnr("raa", method="chainladder", tail="constant", tail_factor=1.10)
+    assert "error" not in out
+
+
+def test_glm_method(agent):
+    a = ChainladderAgent()
+    a.load_sample("genins", "g")
+    out = a.ibnr("g", method="glm", method_params={"power": 1.5})
+    assert "error" not in out and out["total_ibnr"] > 0
+
+
+def test_barnett_zehnwirth_method():
+    a = ChainladderAgent()
+    a.load_sample("genins", "g")
+    out = a.ibnr("g", method="barnett_zehnwirth")
+    assert "error" not in out and out["total_ultimate"] > 0
+
+
+def test_development_constant_requires_patterns(agent):
+    assert "error" in agent.ibnr("raa", method="development_constant")
+    out = agent.ibnr("raa", method="development_constant",
+                     method_params={"patterns": {12: 3.0, 24: 1.7, 36: 1.3, 48: 1.2,
+                                                  60: 1.1, 72: 1.05, 84: 1.02,
+                                                  96: 1.01, 108: 1.005}})
+    assert "error" not in out and out["total_ibnr"] > 0
+
+
+def test_munich_adjustment():
+    a = ChainladderAgent()
+    a.load_sample("mcl", "mcl")
+    out = a.munich_adjustment("mcl")
+    assert {"paid", "incurred"} <= set(out)
+    assert out["paid"]["total_ultimate"] > 0
+    assert out["incurred"]["total_ultimate"] > 0
+
+
+def test_munich_requires_both_columns(agent):
+    assert "error" in agent.munich_adjustment("raa")  # raa is single-column
+
+
+def test_voting_reserve_blends(agent):
+    cl_ibnr = agent.ibnr("raa", method="chainladder")["total_ibnr"]
+    cc_ibnr = agent.ibnr("raa", method="cape_cod", exposure=20000)["total_ibnr"]
+    out = agent.voting_reserve(
+        "raa",
+        estimators=[{"method": "chainladder", "weight": 0.5},
+                    {"method": "cape_cod", "weight": 0.5}],
+        exposure=20000,
+    )
+    assert "error" not in out
+    assert min(cl_ibnr, cc_ibnr) <= out["total_ibnr"] <= max(cl_ibnr, cc_ibnr)
+    assert sum(c["weight"] for c in out["components"]) == pytest.approx(1.0)
+
+
+def test_voting_rejects_unknown_method(agent):
+    out = agent.voting_reserve("raa", estimators=[{"method": "glm", "weight": 1.0}])
+    assert "error" in out
+
+
+def test_correlation_tests(agent):
+    out = agent.correlation_tests("raa")
+    assert isinstance(out["development_correlation"]["reject_independence"], bool)
+    assert isinstance(out["valuation_correlation"]["significant_calendar_effect"], bool)
+    assert out["valuation_correlation"]["range"][0] < out["valuation_correlation"]["range"][1]
+
+
+def test_apply_trend_then_reserve(agent):
+    out = agent.apply_trend("raa", trend=0.05, new_triangle_id="raa_tr")
+    assert out["triangle_id"] == "raa_tr"
+    assert "error" not in agent.ibnr("raa_tr", method="chainladder")
+
+
 def test_all_outputs_json_serializable(agent):
     for payload in (
         agent.list_samples(),

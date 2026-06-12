@@ -36,6 +36,10 @@ Two console scripts are registered:
 | `mack_diagnostics` | Mack stochastic standard error & coefficient of variation |
 | `bootstrap` | ODP-bootstrap reserve distribution (mean, std, CoV, percentiles) |
 | `berquist_sherman` | Berquist-Sherman case-reserve/settlement-rate adjustment |
+| `munich_adjustment` | Munich chain ladder (joint paid & incurred) |
+| `voting_reserve` | Weighted ensemble of reserving methods |
+| `correlation_tests` | Mack development & valuation correlation diagnostics |
+| `apply_trend` | Apply an annual compound trend to a triangle |
 
 ### Reserving methods (`ibnr` / `reserve_summary`)
 
@@ -48,10 +52,21 @@ Two console scripts are registered:
 | `cape_cod` | Stanard-Bühlmann; needs `exposure` |
 | `expected_loss` | Budgeted-loss method; needs `exposure` + `apriori` |
 | `incremental_additive` | Additive (AF) method; needs `exposure` |
-| `clark_ldf` | Clark's growth-curve (LDF) method |
+| `clark_ldf` | Clark's growth-curve (LDF) method (`method_params={growth}`) |
+| `glm` | Tweedie GLM (`method_params={power, link}`) |
+| `barnett_zehnwirth` | Probabilistic Trend Family (`method_params={formula}`) |
+| `development_constant` | User-supplied LDFs (`method_params={patterns, style}`) |
 
 Exposure-based methods take an `exposure` (a number, a per-origin list, or a
-sample name) and, where relevant, an `apriori` loss ratio.
+sample name) and, where relevant, an `apriori` loss ratio. Method-specific
+options are passed as a `method_params` object.
+
+### Tails
+
+`fit_tail` and the `tail` argument of the reserving tools support every
+chainladder tail: `curve` (exponential / inverse-power, via `tail_curve`),
+`constant` (a user `tail_factor`), `bondy`, and `clark`. In the reserving tools
+`tail` may also be a bool (`true` = curve).
 
 ### Stochastic reserving
 
@@ -59,6 +74,16 @@ sample name) and, where relevant, an `apriori` loss ratio.
 - `bootstrap` — over-dispersed Poisson bootstrap; returns the mean, standard
   error, CoV and percentiles of the simulated total-IBNR distribution
   (`n_sims`, `random_state` for reproducibility).
+
+### Diagnostics, ensembles and adjustments
+
+- `correlation_tests` — Mack's development-factor and calendar-period
+  (valuation) correlation tests for the chain-ladder independence assumptions.
+- `voting_reserve` — a weighted ensemble of `chainladder`, `bornhuetter_ferguson`,
+  `benktander`, `cape_cod` and `expected_loss`.
+- `munich_adjustment` — Munich chain ladder reconciling paid and incurred.
+- `berquist_sherman` — case-reserve adequacy / settlement-rate restatement.
+- `apply_trend` — compound trend along the origin or valuation axis.
 
 ### Multi-column / multi-segment triangles
 
@@ -103,9 +128,14 @@ chainladder ibnr raa --method chainladder --summary
 chainladder ibnr raa --method bornhuetter_ferguson --apriori 0.7 --exposure 20000
 chainladder ibnr raa --method incremental_additive --exposure 20000   # additive (AF)
 chainladder ibnr raa --method clark_ldf
-chainladder mack raa --tail
+chainladder ibnr raa --method glm --method-params '{"power": 1.5}'
+chainladder ibnr raa --tail clark                                      # tail methods
+chainladder mack raa --tail bondy
 chainladder bootstrap raa --n-sims 1000 --random-state 42              # stochastic
 chainladder berquist-sherman berqsherm --trend 0.15 --column Incurred  # adjust + reserve
+chainladder munich mcl                                                 # paid & incurred
+chainladder voting raa --estimators '[{"method":"chainladder","weight":0.5},{"method":"cape_cod","weight":0.5}]' --exposure 20000
+chainladder correlation raa                                            # Mack diagnostics
 chainladder serve                       # == chainladder-mcp
 chainladder tools                       # list tools through a server subprocess
 chainladder call development_factors --json '{"triangle_id": "raa", "average": ["simple", "volume", "volume", "volume", "volume", "volume", "volume", "volume", "volume"]}'
@@ -158,6 +188,14 @@ asyncio.run(main())
 
 Anything exposing a compatible `completion(...)` — `actllminfer.completion`, an
 `actllminfer.Router`, or an `actrouter` router — works the same way.
+
+## Not exposed
+
+A few estimators need out-of-band inputs that don't fit a JSON tool interface
+and are intentionally omitted: `DevelopmentML` (a user-supplied scikit-learn
+estimator), `ParallelogramOLF` (a premium rate-change history), and
+`CaseOutstanding` (a paid/incurred case-development configuration). They remain
+available through the Python API.
 
 ## Tests
 

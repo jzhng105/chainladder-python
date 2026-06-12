@@ -55,23 +55,44 @@ def _tool_definitions() -> list[types.Tool]:
         "description": "Number of recent periods to average (-1 = all); an "
         "integer, or a per-development-period list.",
     }
-    tail = {"type": "boolean", "default": False, "description": "Apply a fitted tail curve."}
+    tail = {
+        "anyOf": [
+            {"type": "boolean"},
+            {"type": "string", "enum": ["none", "curve", "constant", "bondy", "clark"]},
+        ],
+        "default": False,
+        "description": "Tail method: false/'none', true/'curve' (extrapolation), "
+        "'constant' (use tail_factor), 'bondy', or 'clark'.",
+    }
     tail_curve = {
         "type": "string",
         "enum": ["exponential", "inverse_power"],
         "default": "exponential",
-        "description": "Tail extrapolation curve.",
+        "description": "Curve used when tail='curve'.",
+    }
+    tail_factor = {
+        "type": "number",
+        "default": 1.0,
+        "description": "Tail factor used when tail='constant'.",
     }
     method = {
         "type": "string",
         "enum": [
             "chainladder", "mack", "bornhuetter_ferguson", "benktander", "cape_cod",
-            "expected_loss", "incremental_additive", "clark_ldf",
+            "expected_loss", "incremental_additive", "clark_ldf", "glm",
+            "barnett_zehnwirth", "development_constant",
         ],
         "default": "chainladder",
-        "description": "Reserving method. 'incremental_additive' is the additive "
-        "(AF) method and 'expected_loss' the budgeted-loss method (both need "
-        "exposure); 'clark_ldf' is Clark's growth-curve method.",
+        "description": "Reserving method. 'incremental_additive' = additive (AF), "
+        "'expected_loss' = budgeted loss (both need exposure); 'clark_ldf' = Clark "
+        "growth curve; 'glm' = Tweedie GLM; 'barnett_zehnwirth' = probabilistic "
+        "trend family; 'development_constant' = user LDFs (see method_params).",
+    }
+    method_params = {
+        "type": "object",
+        "description": "Method-specific options: glm -> {power, link}; "
+        "barnett_zehnwirth -> {formula}; clark_ldf -> {growth}; "
+        "development_constant -> {patterns: {age: factor}, style}.",
     }
     column = {
         "type": "string",
@@ -136,8 +157,10 @@ def _tool_definitions() -> list[types.Tool]:
         "average": average_or_list,
         "tail": tail,
         "tail_curve": tail_curve,
+        "tail_factor": tail_factor,
         "apriori": apriori,
         "exposure": exposure,
+        "method_params": method_params,
         **selection_props,
     }
 
@@ -240,12 +263,20 @@ def _tool_definitions() -> list[types.Tool]:
         ),
         types.Tool(
             name="fit_tail",
-            description="Fit a tail curve and report the tail factor and extended CDFs.",
+            description="Fit a tail (curve/constant/bondy/clark) and report the "
+            "tail factor and extended CDFs.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "triangle_id": {"type": "string"},
+                    "method": {
+                        "type": "string",
+                        "enum": ["curve", "constant", "bondy", "clark"],
+                        "default": "curve",
+                        "description": "Tail method.",
+                    },
                     "curve": tail_curve,
+                    "tail_factor": tail_factor,
                     "n_periods": n_periods,
                     "average": average_or_list,
                     **selection_props,
@@ -282,6 +313,7 @@ def _tool_definitions() -> list[types.Tool]:
                     "average": average_or_list,
                     "tail": tail,
                     "tail_curve": tail_curve,
+                    "tail_factor": tail_factor,
                     **selection_props,
                 },
                 "required": ["triangle_id"],
@@ -328,6 +360,79 @@ def _tool_definitions() -> list[types.Tool]:
                 "required": ["triangle_id"],
             },
         ),
+        types.Tool(
+            name="munich_adjustment",
+            description="Munich chain ladder: jointly develop paid & incurred "
+            "triangles, returning ultimates/IBNR for both bases.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "triangle_id": {"type": "string"},
+                    "paid": {"type": "string", "default": "paid"},
+                    "incurred": {"type": "string", "default": "incurred"},
+                },
+                "required": ["triangle_id"],
+            },
+        ),
+        types.Tool(
+            name="voting_reserve",
+            description="Weighted ensemble (voting) of reserving methods.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "triangle_id": {"type": "string"},
+                    "estimators": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "method": {"type": "string"},
+                                "weight": {"type": "number"},
+                                "apriori": {"type": "number"},
+                            },
+                            "required": ["method"],
+                        },
+                        "description": "Components, e.g. [{\"method\": \"chainladder\", "
+                        "\"weight\": 0.5}, {\"method\": \"bornhuetter_ferguson\", "
+                        "\"weight\": 0.5, \"apriori\": 0.7}]. Supports chainladder, "
+                        "bornhuetter_ferguson, benktander, cape_cod, expected_loss.",
+                    },
+                    "exposure": exposure,
+                    "column": column,
+                },
+                "required": ["triangle_id"],
+            },
+        ),
+        types.Tool(
+            name="correlation_tests",
+            description="Mack's development and valuation (calendar-period) "
+            "correlation diagnostics for the chain-ladder assumptions.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "triangle_id": {"type": "string"},
+                    "column": column,
+                },
+                "required": ["triangle_id"],
+            },
+        ),
+        types.Tool(
+            name="apply_trend",
+            description="Apply an annual compound trend along an axis; caches the "
+            "trended triangle under a new triangle_id.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "triangle_id": {"type": "string"},
+                    "trend": {"type": "number", "default": 0.0,
+                              "description": "Annual compound trend, e.g. 0.05."},
+                    "axis": {"type": "string", "enum": ["origin", "valuation"],
+                             "default": "origin"},
+                    "new_triangle_id": {"type": "string", "description": "Optional cache id."},
+                },
+                "required": ["triangle_id"],
+            },
+        ),
     ]
 
 
@@ -348,6 +453,10 @@ def _dispatch():
         "mack_diagnostics": agent.mack_diagnostics,
         "bootstrap": agent.bootstrap,
         "berquist_sherman": agent.berquist_sherman,
+        "munich_adjustment": agent.munich_adjustment,
+        "voting_reserve": agent.voting_reserve,
+        "correlation_tests": agent.correlation_tests,
+        "apply_trend": agent.apply_trend,
     }
 
 
